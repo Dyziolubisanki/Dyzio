@@ -12,13 +12,14 @@ from urllib.parse import urljoin, urlparse
 
 import pandas as pd
 from selenium import webdriver
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import NoSuchElementException, TimeoutException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 BASE_URL = "https://www.filmweb.pl/search#/film?page={page}"
 FILMWEB_ORIGIN = "https://www.filmweb.pl"
+DATA_JSON_PATH = str(Path(__file__).resolve().parent / "data.json")
 
 USER_AGENTS = [
     # Desktop Chrome (Windows)
@@ -266,6 +267,42 @@ def _extract_from_json_ld(driver: webdriver.Chrome) -> dict:
     return data
 
 
+def _parse_rating_value(raw_text: str) -> str:
+    """
+    Zamienia np. '7,8' na '7.8' oraz zwraca 'Brak' gdy nie da się.
+    """
+    if not raw_text:
+        return "Brak"
+    txt = raw_text.strip()
+    m = re.search(r"\b\d([.,]\d)?\b", txt)
+    if not m:
+        return "Brak"
+    return m.group(0).replace(",", ".")
+
+
+def _extract_rating_by_anchor(driver: webdriver.Chrome, anchor_class_substring: str) -> str:
+    """
+    Filmweb ma ratingi w strukturze:
+    <a class="filmRating filmRating--filmRate ... href=..."><span class="filmRating__rateValue">7,8</span>...</a>
+    oraz osobno dla krytyków: filmRating--filmCritic.
+    """
+    anchors = driver.find_elements(
+        By.XPATH,
+        f"//a[contains(@class,'filmRating') and contains(@class,'{anchor_class_substring}')]",
+    )
+    for a in anchors:
+        try:
+            # bierzemy pierwszą wartość rateValue w obrębie anchor.
+            spans = a.find_elements(By.CSS_SELECTOR, "span.filmRating__rateValue")
+            for sp in spans:
+                val = _parse_rating_value(sp.text)
+                if val != "Brak":
+                    return val
+        except Exception:
+            continue
+    return "Brak"
+
+
 @dataclass
 class MovieRow:
     title: str
@@ -277,8 +314,22 @@ class MovieRow:
 def _scrape_movie_page(driver: webdriver.Chrome, wait: WebDriverWait, url: str) -> MovieRow:
     driver.get(url)
 
-    # Czekamy na tytuł.
-    wait.until(EC.presence_of_element_located((By.XPATH, "//h1")))
+    # Czekamy na tytuł / dane meta (czasem SPA szybciej daje og:title niż wyrenderuje <h1>).
+    wait.until(
+        lambda d: d.find_elements(By.XPATH, "//h1")
+        or d.find_elements(By.CSS_SELECTOR, "meta[property='og:title']")
+    )
+
+    # Oceny zwykle renderują się jako osobne panele — poczekaj krótko na choćby “użytkowników”.
+    try:
+        wait.until(
+            EC.presence_of_element_located(
+                (By.XPATH, "//a[contains(@class,'filmRating') and contains(@class,'filmRating--filmRate')]")
+            )
+        )
+    except TimeoutException:
+        # Nie blokujemy: jeśli panel nie zdąży się wyrenderować, fallbacky zadziałają lub zwrócimy "Brak".
+        pass
 
     json_ld = _extract_from_json_ld(driver)
 
@@ -298,50 +349,16 @@ def _scrape_movie_page(driver: webdriver.Chrome, wait: WebDriverWait, url: str) 
     if title == "Brak" and isinstance(json_ld.get("name"), str):
         title = json_ld["name"].strip() or title
 
-    # Ocena użytkowników
-    user_rating = "Brak"
-    # Próby “DOM-first” (różne layouty / A/B testy)
-    dom_user_xpaths = [
-        # Często rating jest w blokach obok gwiazdek/liczb
-        "//*[contains(@class,'filmRating') or contains(@class,'rating')][.//text()[contains(.,'Ocena')]]//*[self::span or self::div][normalize-space()!=''][1]",
-        # Fallback: pierwsza liczba w okolicach słów "użytkowników"
-        "//*[contains(translate(., 'UŻYTKOWNIKÓW', 'użytkowników'),'użytkowników')]/following::*[1]",
-    ]
-    for xp in dom_user_xpaths:
-        try:
-            el = driver.find_element(By.XPATH, xp)
-            txt = (el.text or "").strip()
-            m = re.search(r"\b\d([.,]\d)?\b", txt)
-            if m:
-                user_rating = m.group(0).replace(",", ".")
-                break
-        except Exception:
-            continue
-    if user_rating == "Brak" and isinstance(json_ld.get("user_rating"), str):
-        user_rating = json_ld["user_rating"].strip() or user_rating
+    # Ocena użytkowników i krytyków:
+    # W HTML masz:
+    # - użytkownicy: filmRating--filmRate
+    # - krytycy: filmRating--filmCritic
+    user_rating = _extract_rating_by_anchor(driver, "filmRating--filmRate")
+    critics_rating = _extract_rating_by_anchor(driver, "filmRating--filmCritic")
 
-    # Ocena krytyków (czasem brak)
-    critics_rating = "Brak"
-    dom_crit_xpaths = [
-        # Szukamy etykiety “krytyków” i bierzemy najbliższą liczbę obok/poniżej
-        (
-            "//*[contains(translate(., 'KRYTYKÓW', 'krytyków'),'krytyków') "
-            "or contains(translate(., 'KRYTYCY', 'krytycy'),'krytycy')]"
-            "/following::*[self::span or self::div][1]"
-        ),
-        # Alternatywnie: jakikolwiek widoczny element zawierający "krytyków" i liczbę w tym samym bloku
-        "//*[contains(translate(., 'KRYTYKÓW', 'krytyków'),'krytyków') and (self::div or self::section)]",
-    ]
-    for xp in dom_crit_xpaths:
-        try:
-            el = driver.find_element(By.XPATH, xp)
-            txt = (el.text or "").strip()
-            m = re.search(r"\b\d([.,]\d)?\b", txt)
-            if m:
-                critics_rating = m.group(0).replace(",", ".")
-                break
-        except Exception:
-            continue
+    # Fallback z JSON-LD (tylko jeśli DOM nie zwrócił)
+    if user_rating == "Brak" and isinstance(json_ld.get("user_rating"), str):
+        user_rating = _parse_rating_value(json_ld["user_rating"])
 
     print(
         f"[DEBUG] Film: {title!r} | użytkownicy={user_rating!r} | krytycy={critics_rating!r}"
@@ -357,6 +374,39 @@ def scrape_filmweb_top_500(output_csv: str = "filmweb_top500.csv") -> None:
     collected: list[MovieRow] = []
     seen_urls: set[str] = set()
 
+    # Czyścimy plik JSON docelowy na start.
+    try:
+        with open(DATA_JSON_PATH, "w", encoding="utf-8") as f:
+            json.dump([], f, ensure_ascii=False)
+    except Exception as e:
+        print(f"[DEBUG] Nie udało się wyczyścić pliku {DATA_JSON_PATH}: {e!r}")
+
+    def _append_to_data_json(row: MovieRow) -> None:
+        try:
+            # Prosty i bezpieczny mechanizm: trzymamy JSON jako tablicę obiektów.
+            # Przy 500 rekordach koszty są akceptowalne, a zyskujemy odporność na przerwanie skryptu.
+            try:
+                with open(DATA_JSON_PATH, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if not isinstance(data, list):
+                        data = []
+            except Exception:
+                data = []
+
+            data.append(
+                {
+                    "Tytuł": row.title,
+                    "Ocena użytkowników": row.user_rating,
+                    "Ocena krytyków": row.critics_rating,
+                    "URL": row.url,
+                }
+            )
+
+            with open(DATA_JSON_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[DEBUG] Nie udało się zapisać rekordu do {DATA_JSON_PATH}: {e!r}")
+
     try:
         page = 1
         while len(collected) < 500:
@@ -370,7 +420,8 @@ def scrape_filmweb_top_500(output_csv: str = "filmweb_top500.csv") -> None:
             except TimeoutException:
                 print("[DEBUG] Timeout podczas oczekiwania na wyniki wyszukiwania.")
                 _dump_debug_page(driver, f"search_timeout_page_{page}")
-                raise
+                # Nie rzuć błędu: zapisujemy co zdążyliśmy zebrać.
+                break
 
             page_links = _collect_movie_links_from_results(driver)
             if not page_links:
@@ -384,35 +435,47 @@ def scrape_filmweb_top_500(output_csv: str = "filmweb_top500.csv") -> None:
                     break
                 if link in seen_urls:
                     continue
+                # Retry: czasem SPA potrzebuje chwili dłużej na wyrenderowanie ocen
+                row = None
+                last_err: Optional[str] = None
+                for attempt in range(1, 3):
+                    try:
+                        row = _scrape_movie_page(driver, wait, link)
+                        break
+                    except TimeoutException as e:
+                        last_err = f"timeout attempt {attempt}: {e!r}"
+                        print(f"[DEBUG] Timeout na stronie filmu (retry {attempt}/2): {link}")
+                        _small_human_delay(0.6, 1.2)
+                    except Exception as e:
+                        last_err = f"error attempt {attempt}: {e!r}"
+                        print(f"[DEBUG] Błąd podczas scrapowania filmu (retry {attempt}/2): {link} | {e!r}")
+                        _small_human_delay(0.6, 1.2)
 
-                seen_urls.add(link)
-                try:
-                    row = _scrape_movie_page(driver, wait, link)
+                if row is None:
+                    print(f"[DEBUG] Pomijam film (nie udało się po retry): {link} | last_err={last_err}")
+                else:
+                    seen_urls.add(link)
                     collected.append(row)
-                except TimeoutException:
-                    print(f"[DEBUG] Timeout na stronie filmu: {link}")
-                except Exception as e:
-                    print(f"[DEBUG] Błąd podczas scrapowania filmu: {link} | {e!r}")
+                    _append_to_data_json(row)
 
                 _small_human_delay(0.35, 1.1)
 
             page += 1
             _small_human_delay(0.7, 1.6)
 
-        # Zapis do CSV
-        df = pd.DataFrame(
-            [
-                {
-                    "Tytuł": r.title,
-                    "Ocena użytkowników": r.user_rating,
-                    "Ocena krytyków": r.critics_rating,
-                    "URL": r.url,
-                }
-                for r in collected[:500]
-            ]
-        )
-        df.to_csv(output_csv, index=False, encoding="utf-8-sig")
-        print(f"[DEBUG] Zapisano {len(df)} rekordów do pliku: {output_csv}")
+        # Finalny zapis do JSON (upewniamy się, że plik ma kompletną tablicę).
+        final_data = [
+            {
+                "Tytuł": r.title,
+                "Ocena użytkowników": r.user_rating,
+                "Ocena krytyków": r.critics_rating,
+                "URL": r.url,
+            }
+            for r in collected[:500]
+        ]
+        with open(DATA_JSON_PATH, "w", encoding="utf-8") as f:
+            json.dump(final_data, f, ensure_ascii=False, indent=2)
+        print(f"[DEBUG] Zapisano {len(final_data)} rekordów do pliku JSON: {DATA_JSON_PATH}")
 
     finally:
         driver.quit()
